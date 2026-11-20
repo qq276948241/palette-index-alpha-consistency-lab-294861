@@ -63,12 +63,51 @@
 		// selection of color-distance equation
 		this.colorDist = opts.colorDist == "manhattan" ? distManhattan : distEuclidean;
 
+		// alpha handling strategy:
+		//   "ignore"      - legacy default: alpha==0 pixels are skipped during sampling and
+		//                   produce null (sparse) indices / transparent-black pixels on reduce
+		//   "transparent" - pixels with alpha <= alphaThreshold are mapped to a single reserved
+		//                   transparent palette slot (counted against the `colors` budget)
+		//   "premultiply" - pixels participate in quantization with premultiplied-alpha colors
+		this.alphaMode = opts.alphaMode || "ignore";
+		if (this.alphaMode != "ignore" && this.alphaMode != "transparent" && this.alphaMode != "premultiply")
+			throw quantErr('invalid alphaMode "' + this.alphaMode + '" (expected "ignore", "transparent" or "premultiply")');
+		// pixels with alpha <= alphaThreshold are treated as transparent ("transparent" mode only)
+		this.alphaThreshold = opts.alphaThreshold || 0;
+		if (!isInt(this.alphaThreshold) || this.alphaThreshold < 0 || this.alphaThreshold > 255)
+			throw quantErr("alphaThreshold must be an integer between 0 and 255");
+
+		// i32 value of the transparent palette slot (null when the palette has none)
+		this.transI32 = null;
+		// whether the palette currently holds a transparent slot
+		this.hasTrans = false;
+		// number of sampled pixels mapped to the transparent slot
+		this.transCount = 0;
+		// tiled sampling state (see sampleTiled)
+		this._tiled = null;
+		this._tileFull = null;
+		this._tileGrid = null;
+		this._boxLocal = {};
+		// effective palette budget during buildPal (colors minus reserved transparent slot)
+		this._budget = null;
+
 		// if pre-defined palette, build lookups
 		if (this.idxrgb.length > 0) {
 			var self = this;
 			this.idxrgb.forEach(function(rgb, i) {
+				if (!rgb || rgb.length < 3 || rgb.length > 4)
+					throw quantErr("palette entry " + i + " must be an [r,g,b] or [r,g,b,a] array");
+
+				for (var c = 0; c < rgb.length; c++) {
+					if (!isInt(rgb[c]) || rgb[c] < 0 || rgb[c] > 255)
+						throw quantErr("palette entry " + i + " has invalid channel value " + rgb[c]);
+				}
+
+				// alpha of a 4th channel is honored in "transparent" mode only
+				var alpha = (self.alphaMode == "transparent" && rgb.length > 3) ? rgb[3] : 255;
+
 				var i32 = (
-					(255    << 24) |	// alpha
+					(alpha << 24) |	// alpha
 					(rgb[2] << 16) |	// blue
 					(rgb[1] <<  8) |	// green
 					 rgb[0]				// red
@@ -76,28 +115,45 @@
 
 				self.idxi32[i]		= i32;
 				self.i32idx[i32]	= i;
-				self.i32rgb[i32]	= rgb;
+				self.i32rgb[i32]	= rgb.slice(0, 3);
+
+				if (alpha <= self.alphaThreshold && self.transI32 === null) {
+					self.transI32 = i32;
+					self.hasTrans = true;
+				}
 			});
 		}
 	}
 
 	// gathers histogram info
+	// @width: legacy number, or tile opts {width, height, x, y, fullWidth, fullHeight}
+	//         for submitting sub-rectangles of a larger image (see sampleTiled)
 	RgbQuant.prototype.sample = function sample(img, width) {
 		if (this.palLocked)
 			throw "Cannot sample additional images, palette already assembled.";
 
-		var data = getImageData(img, width);
+		var tileOpts = (width != null && typeof width == "object") ? width : null,
+			data = getImageData(img, tileOpts ? {width: tileOpts.width, height: tileOpts.height} : width);
 
-		switch (this.method) {
-			case 1: this.colorStats1D(data.buf32); break;
-			case 2: this.colorStats2D(data.buf32, data.width); break;
+		if (tileOpts)
+			this.sampleTiled(data, tileOpts);
+		else {
+			if (this._tiled === true)
+				throw quantErr("cannot mix tiled and untiled sample calls");
+			this._tiled = false;
+
+			switch (this.method) {
+				case 1: this.colorStats1D(data.buf32); break;
+				case 2: this.colorStats2D(data.buf32, data.width); break;
+			}
 		}
 	};
 
 	// image quantizer
 	// todo: memoize colors here also
 	// @retType: 1 - Uint8Array (default), 2 - Indexed array, 3 - Match @img type (unimplemented, todo)
-	RgbQuant.prototype.reduce = function reduce(img, retType, dithKern, dithSerp) {
+	// @width: optional pixel width for raw array inputs (required for correct dithering of typed arrays)
+	RgbQuant.prototype.reduce = function reduce(img, retType, dithKern, dithSerp, width) {
 		if (!this.palLocked)
 			this.buildPal();
 
@@ -108,9 +164,9 @@
 
 		// reduce w/dither
 		if (dithKern)
-			var out32 = this.dither(img, dithKern, dithSerp);
+			var out32 = this.dither(img, dithKern, dithSerp, width);
 		else {
-			var data = getImageData(img),
+			var data = getImageData(img, width),
 				buf32 = data.buf32,
 				len = buf32.length,
 				out32 = new Uint32Array(len);
@@ -138,7 +194,7 @@
 	};
 
 	// adapted from http://jsbin.com/iXofIji/2/edit by PAEz
-	RgbQuant.prototype.dither = function(img, kernel, serpentine) {
+	RgbQuant.prototype.dither = function(img, kernel, serpentine, width) {
 		// http://www.tannerhelland.com/4660/dithering-eleven-algorithms-source-code/
 		var kernels = {
 			FloydSteinberg: [
@@ -231,9 +287,11 @@
 
 		var ds = kernels[kernel];
 
-		var data = getImageData(img),
+		var data = getImageData(img, width),
 //			buf8 = data.buf8,
-			buf32 = data.buf32,
+			// work on a copy so the caller's buffer is never mutated and
+			// repeated reduce() calls reproduce pixel-for-pixel
+			buf32 = new Uint32Array(data.buf32),
 			width = data.width,
 			height = data.height,
 			len = buf32.length;
@@ -249,8 +307,21 @@
 			for (var x = (dir == 1 ? 0 : width - 1), xend = (dir == 1 ? width : 0); x !== xend; x += dir) {
 				// Image pixel
 				var idx = lni + x,
-					i32 = buf32[idx],
-					r1 = (i32 & 0xff),
+					i32 = buf32[idx];
+
+				if (this.alphaMode == "premultiply")
+					i32 = premultI32(i32);
+
+				var alpha = (i32 & 0xff000000) >>> 24,
+					isTrans = this.alphaMode == "transparent" ? alpha <= this.alphaThreshold : alpha == 0;
+
+				// transparent pixels stay transparent and never diffuse error into opaque regions
+				if (isTrans) {
+					buf32[idx] = (this.alphaMode == "transparent" && this.hasTrans) ? this.transI32 : 0;
+					continue;
+				}
+
+				var r1 = (i32 & 0xff),
 					g1 = (i32 & 0xff00) >> 8,
 					b1 = (i32 & 0xff0000) >> 16;
 
@@ -296,8 +367,10 @@
 							g4 = Math.max(0, Math.min(255, g3 + eg * d)),
 							b4 = Math.max(0, Math.min(255, b3 + eb * d));
 
+						// alpha of the receiving pixel is preserved, so error
+						// landing on transparent pixels is discarded with them
 						buf32[idx2] =
-							(255 << 24)	|	// alpha
+							(buf32[idx2] & 0xff000000)	|	// alpha
 							(b4  << 16)	|	// blue
 							(g4  <<  8)	|	// green
 							 r4;			// red
@@ -313,11 +386,29 @@
 	RgbQuant.prototype.buildPal = function buildPal(noSort) {
 		if (this.palLocked || this.idxrgb.length > 0 && this.idxrgb.length <= this.colors) return;
 
+		this.finalizeTiles();
+
 		var histG  = this.histogram,
 			sorted = sortedHashKeys(histG, true);
 
-		if (sorted.length == 0)
+		// reserve a palette slot for transparency when the caller opted in and
+		// transparent pixels were actually sampled (counts against `colors` budget)
+		var wantTrans = this.alphaMode == "transparent" && this.transI32 === null &&
+			this.transCount > 0 && this.idxrgb.length == 0;
+
+		if (sorted.length == 0) {
+			// an image of only transparent pixels still gets a (single-slot) palette
+			if (wantTrans) {
+				this.addTransSlot();
+				this.palLocked = true;
+				return;
+			}
 			throw "Nothing has been sampled, palette cannot be built.";
+		}
+
+		this._budget = this.colors - (wantTrans ? 1 : 0);
+		if (this._budget < 1)
+			throw quantErr("colors budget too small: transparent slot leaves no room for opaque colors");
 
 		switch (this.method) {
 			case 1:
@@ -350,16 +441,94 @@
 		if (!noSort && this.reIndex)
 			this.sortPal();
 
+		// transparent slot lives at index 0, outside the sorted opaque range
+		if (wantTrans)
+			this.addTransSlot();
+
 		// build cache of top histogram colors
 		if (this.useCache)
 			this.cacheHistogram(idxi32);
 
+		this._budget = null;
 		this.palLocked = true;
+	};
+
+	// prepends the reserved transparent slot (index 0) to a generated palette
+	RgbQuant.prototype.addTransSlot = function addTransSlot() {
+		this.transI32 = 0;
+		this.idxrgb.unshift([0,0,0]);
+		this.idxi32.unshift(0);
+		this.i32rgb[0] = [0,0,0];
+
+		for (var i = 0; i < this.idxi32.length; i++)
+			this.i32idx[this.idxi32[i]] = i;
+
+		this.hasTrans = true;
 	};
 
 	RgbQuant.prototype.palette = function palette(tuples, noSort) {
 		this.buildPal(noSort);
 		return tuples ? this.idxrgb : new Uint8Array((new Uint32Array(this.idxi32)).buffer);
+	};
+
+	// explicit RGBA view of the palette; index i occupies bytes [i*4, i*4+4)
+	// so reduce(img, 2) indices, paletteRGBA() and expand() stay in correspondence
+	RgbQuant.prototype.paletteRGBA = function paletteRGBA(noSort) {
+		this.buildPal(noSort);
+		return new Uint8Array((new Uint32Array(this.idxi32)).buffer);
+	};
+
+	// reverse of reduce(img, 2): expands an (optionally sparse) indexed pixel array
+	// back to RGBA bytes using the current palette
+	RgbQuant.prototype.expand = function expand(indexed, width, height) {
+		if (!this.palLocked)
+			this.buildPal();
+
+		if (!indexed || typeof indexed.length != "number")
+			throw quantErr("indexed pixels must be an array or typed array");
+
+		var len = indexed.length;
+
+		if (len == 0)
+			throw quantErr("indexed pixel array is empty");
+
+		if (width != null && (!isInt(width) || width <= 0))
+			throw quantErr("width must be a positive integer, got " + width);
+		if (height != null && (!isInt(height) || height <= 0))
+			throw quantErr("height must be a positive integer, got " + height);
+
+		if (width == null)
+			width = len;
+		if (height == null) {
+			if (len % width != 0)
+				throw quantErr("pixel count " + len + " is not divisible by width " + width);
+			height = len / width;
+		}
+
+		if (width * height > MAX_PIXELS)
+			throw quantErr("image dimensions " + width + "x" + height + " exceed maximum of " + MAX_PIXELS + " pixels");
+
+		if (width * height != len)
+			throw quantErr("indexed pixel count " + len + " does not match dimensions " + width + "x" + height);
+
+		var out32 = new Uint32Array(len);
+
+		for (var i = 0; i < len; i++) {
+			var idx = indexed[i];
+
+			// sparse holes (transparent pixels in "ignore" mode) expand to transparent black
+			if (idx == null) {
+				out32[i] = 0;
+				continue;
+			}
+
+			if (!isInt(idx) || idx < 0 || idx >= this.idxi32.length || this.idxi32[idx] == null)
+				throw quantErr("invalid palette index " + idx + " at pixel " + i);
+
+			out32[i] = this.idxi32[idx];
+		}
+
+		return new Uint8Array(out32.buffer);
 	};
 
 	RgbQuant.prototype.prunePal = function prunePal(keep) {
@@ -398,21 +567,30 @@
 
 	// reduces similar colors from an importance-sorted Uint32 rgba array
 	RgbQuant.prototype.reducePal = function reducePal(idxi32) {
+		// palette budget; a reserved transparent slot (generated palettes) shrinks it by one
+		var maxCols = this._budget != null ? this._budget : this.colors;
+
 		// if pre-defined palette's length exceeds target
-		if (this.idxrgb.length > this.colors) {
+		if (this.idxrgb.length > maxCols) {
 			// quantize histogram to existing palette
 			var len = idxi32.length, keep = {}, uniques = 0, idx, pruned = false;
 
+			// the transparent slot always survives pruning
+			if (this.transI32 !== null && (""+this.transI32) in this.i32idx) {
+				keep[this.i32idx[this.transI32]] = true;
+				uniques = 1;
+			}
+
 			for (var i = 0; i < len; i++) {
 				// palette length reached, unset all remaining colors (sparse palette)
-				if (uniques == this.colors && !pruned) {
+				if (uniques == maxCols && !pruned) {
 					this.prunePal(keep);
 					pruned = true;
 				}
 
 				idx = this.nearestIndex(idxi32[i]);
 
-				if (uniques < this.colors && !keep[idx]) {
+				if (uniques < maxCols && !keep[idx]) {
 					keep[idx] = true;
 					uniques++;
 				}
@@ -439,8 +617,8 @@
 				thold = this.initDist;
 
 			// palette already at or below desired length
-			if (palLen > this.colors) {
-				while (palLen > this.colors) {
+			if (palLen > maxCols) {
+				while (palLen > maxCols) {
 					var memDist = [];
 
 					// iterate palette
@@ -469,18 +647,18 @@
 					// console.log("palette length: " + palLen);
 
 					// if palette is still much larger than target, increment by larger initDist
-					thold += (palLen > this.colors * 3) ? this.initDist : this.distIncr;
+					thold += (palLen > maxCols * 3) ? this.initDist : this.distIncr;
 				}
 
 				// if palette is over-reduced, re-add removed colors with largest distances from last round
-				if (palLen < this.colors) {
-					// sort descending
+				if (palLen < maxCols) {
+					// sort descending, ties broken by original (ascending) palette position
 					sort.call(memDist, function(a,b) {
-						return b[3] - a[3];
+						return b[3] - a[3] || a[0] - b[0];
 					});
 
 					var k = 0;
-					while (palLen < this.colors) {
+					while (palLen < maxCols) {
 						// re-inject rgb into final palette
 						idxrgb[memDist[k][0]] = memDist[k][1];
 
@@ -503,6 +681,26 @@
 		}
 	};
 
+	// normalizes a pixel according to the alpha strategy; returns null when the
+	// pixel is transparent and must not enter the color histogram
+	RgbQuant.prototype.histKey = function histKey(col) {
+		var alpha = (col & 0xff000000) >>> 24;
+
+		switch (this.alphaMode) {
+			case "premultiply":
+				return premultI32(col);
+			case "transparent":
+				if (alpha <= this.alphaThreshold) {
+					this.transCount++;
+					return null;
+				}
+				// remaining pixels participate as opaque; alpha never enters RGB distance
+				return (col | 0xff000000) >>> 0;
+			default: // "ignore"
+				return alpha == 0 ? null : col;
+		}
+	};
+
 	// global top-population
 	RgbQuant.prototype.colorStats1D = function colorStats1D(buf32) {
 		var histG = this.histogram,
@@ -510,10 +708,10 @@
 			len = buf32.length;
 
 		for (var i = 0; i < len; i++) {
-			col = buf32[i];
+			col = this.histKey(buf32[i]);
 
 			// skip transparent
-			if ((col & 0xff000000) >> 24 == 0) continue;
+			if (col === null) continue;
 
 			// collect hue stats
 			if (this.hueStats)
@@ -542,10 +740,10 @@
 				histL = {}, col;
 
 			iterBox(box, width, function(i) {
-				col = buf32[i];
+				col = self.histKey(buf32[i]);
 
 				// skip transparent
-				if ((col & 0xff000000) >> 24 == 0) return;
+				if (col === null) return;
 
 				// collect hue stats
 				if (self.hueStats)
@@ -566,12 +764,122 @@
 			this.hueStats.inject(histG);
 	};
 
+	// samples a sub-rectangle of a larger image.
+	// tile opts: {width, height, x, y, fullWidth, fullHeight}
+	//   x, y       - tile origin within the full image (default 0, 0)
+	//   fullWidth, fullHeight - full image dims (default: tile dims)
+	// Tiles must be non-overlapping; every submitted pixel is counted exactly once
+	// and uncovered regions contribute nothing. For method 2, per-box counts are
+	// accumulated against the *global* box grid and promoted when the palette is
+	// built, so tiled submission yields the same histogram as whole-image sampling.
+	RgbQuant.prototype.sampleTiled = function sampleTiled(data, opts) {
+		var x0 = opts.x != null ? opts.x : 0,
+			y0 = opts.y != null ? opts.y : 0,
+			fullW = opts.fullWidth != null ? opts.fullWidth : data.width,
+			fullH = opts.fullHeight != null ? opts.fullHeight : data.height;
+
+		if (!isInt(x0) || !isInt(y0) || x0 < 0 || y0 < 0)
+			throw quantErr("tile offset (x, y) must be non-negative integers");
+		if (!isInt(fullW) || !isInt(fullH) || fullW <= 0 || fullH <= 0)
+			throw quantErr("fullWidth/fullHeight must be positive integers");
+		if (x0 + data.width > fullW || y0 + data.height > fullH)
+			throw quantErr("tile at (" + x0 + "," + y0 + ") sized " + data.width + "x" + data.height +
+				" exceeds full image bounds " + fullW + "x" + fullH);
+		if (this._tiled === false)
+			throw quantErr("cannot mix tiled and untiled sample calls");
+		if (this._tileFull) {
+			if (this._tileFull[0] != fullW || this._tileFull[1] != fullH)
+				throw quantErr("inconsistent full image dimensions across tiles: " +
+					this._tileFull[0] + "x" + this._tileFull[1] + " vs " + fullW + "x" + fullH);
+		}
+		else
+			this._tileFull = [fullW, fullH];
+
+		this._tiled = true;
+
+		// method 1 keeps global counts, so tiles are naturally equivalent
+		if (this.method == 1) {
+			this.colorStats1D(data.buf32);
+			return;
+		}
+
+		var grid = this._tileGrid;
+
+		if (!grid) {
+			var boxW = this.boxSize[0],
+				boxH = this.boxSize[1];
+
+			grid = this._tileGrid = {
+				boxes: makeBoxes(fullW, fullH, boxW, boxH),
+				boxCols: Math.ceil(fullW / boxW),
+				boxW: boxW,
+				boxH: boxH,
+			};
+		}
+
+		var buf32 = data.buf32,
+			wid = data.width,
+			len = buf32.length;
+
+		for (var i = 0; i < len; i++) {
+			var col = this.histKey(buf32[i]);
+
+			// skip transparent
+			if (col === null) continue;
+
+			// collect hue stats
+			if (this.hueStats)
+				this.hueStats.check(col);
+
+			var gx = x0 + (i % wid),
+				gy = y0 + ((i / wid) | 0),
+				bidx = (((gy / grid.boxH) | 0) * grid.boxCols) + ((gx / grid.boxW) | 0),
+				local = this._boxLocal[bidx] || (this._boxLocal[bidx] = {});
+
+			local[col] = (local[col] || 0) + 1;
+		}
+	};
+
+	// merges deferred per-box tile counts into the global histogram, replaying the
+	// same promotion rules as colorStats2D in canonical (row-major) box order
+	RgbQuant.prototype.finalizeTiles = function finalizeTiles() {
+		if (!this._tiled || this.method != 2)
+			return;
+
+		var histG = this.histogram,
+			grid = this._tileGrid,
+			area = this.boxSize[0] * this.boxSize[1],
+			boxes = grid.boxes;
+
+		for (var b = 0; b < boxes.length; b++) {
+			var local = this._boxLocal[b];
+			if (!local) continue;
+
+			var effc = Math.max(Math.round((boxes[b].w * boxes[b].h) / area) * this.boxPxls, 2);
+
+			for (var col in local) {
+				var num = local[col];
+
+				if (col in histG)
+					histG[col] += num;
+				else if (num >= effc)
+					histG[col] = num;
+			}
+		}
+
+		if (this.hueStats)
+			this.hueStats.inject(histG);
+
+		this._boxLocal = {};
+	};
+
 	// TODO: group very low lum and very high lum colors
 	// TODO: pass custom sort order
 	RgbQuant.prototype.sortPal = function sortPal() {
 		var self = this;
 
-		this.idxi32.sort(function(a,b) {
+		// stable sort: fully-tied entries keep their (deterministic) frequency order
+		sort.call(this.idxi32, function(a,b) {
 			var idxA = self.i32idx[a],
 				idxB = self.i32idx[b],
 				rgbA = self.idxrgb[idxA],
@@ -609,9 +917,24 @@
 
 	// TOTRY: use HUSL - http://boronine.com/husl/
 	RgbQuant.prototype.nearestIndex = function nearestIndex(i32) {
-		// alpha 0 returns null index
-		if ((i32 & 0xff000000) >> 24 == 0)
-			return null;
+		var mode = this.alphaMode;
+
+		if (mode == "premultiply")
+			i32 = premultI32(i32);
+		else {
+			var alpha = (i32 & 0xff000000) >>> 24;
+
+			if (mode == "transparent") {
+				// below-threshold pixels map to the single transparent slot
+				if (alpha <= this.alphaThreshold)
+					return this.hasTrans ? this.i32idx[this.transI32] : null;
+				// remaining pixels participate as opaque; alpha never enters RGB distance
+				i32 = (i32 | 0xff000000) >>> 0;
+			}
+			// legacy: alpha 0 returns null index
+			else if (alpha == 0)
+				return null;
+		}
 
 		if (this.useCache && (""+i32) in this.i32idx)
 			return this.i32idx[i32];
@@ -623,10 +946,15 @@
 				(i32 & 0xff00) >> 8,
 				(i32 & 0xff0000) >> 16,
 			],
-			len = this.idxrgb.length;
+			len = this.idxrgb.length,
+			skipTrans = mode == "transparent",
+			thresh = this.alphaThreshold;
 
 		for (var i = 0; i < len; i++) {
 			if (!this.idxrgb[i]) continue;		// sparse palettes
+
+			// transparent slots are never the nearest color for opaque pixels
+			if (skipTrans && ((this.idxi32[i] & 0xff000000) >>> 24) <= thresh) continue;
 
 			var dist = this.colorDist(rgb, this.idxrgb[i]);
 
@@ -832,12 +1160,63 @@
 		}).join("");
 	}
 
-	// returns uniform pixel data from various img
-	// TODO?: if array is passed, createimagedata, createlement canvas? take a pxlen?
-	function getImageData(img, width) {
-		var can, ctx, imgd, buf8, buf32, height;
+	// premultiplies a pixel's RGB channels by its alpha and marks it opaque;
+	// idempotent (alpha 255 passes through, alpha 0 becomes opaque black)
+	function premultI32(i32) {
+		var a = (i32 & 0xff000000) >>> 24;
 
-		switch (typeOf(img)) {
+		if (a == 255)
+			return i32;
+		if (a == 0)
+			return 0xff000000;
+
+		var r = Math.round(((i32 & 0xff) * a) / 255),
+			g = Math.round((((i32 & 0xff00) >> 8) * a) / 255),
+			b = Math.round((((i32 & 0xff0000) >> 16) * a) / 255);
+
+		return ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+	}
+
+	var MAX_PIXELS = 0x10000000;	// 268,435,456 px (1 GiB of RGBA)
+
+	// stable error type for all input-validation failures
+	function quantErr(msg) {
+		return new Error("RgbQuant: " + msg);
+	}
+
+	function isInt(v) {
+		return typeof v == "number" && isFinite(v) && Math.floor(v) === v;
+	}
+
+	// 32-bit view over an 8-bit buffer, honoring its byte offset (copies if misaligned)
+	function u32view(buf8) {
+		if (buf8.byteOffset % 4 == 0)
+			return new Uint32Array(buf8.buffer, buf8.byteOffset, buf8.byteLength / 4);
+
+		var copy = new Uint8Array(buf8.byteLength);
+		copy.set(buf8);
+		return new Uint32Array(copy.buffer);
+	}
+
+	// returns uniform pixel data from various img
+	// @opts: legacy number width, or {width, height}
+	function getImageData(img, opts) {
+		var can, ctx, imgd, buf8, buf32, width, height;
+
+		if (opts != null && typeof opts == "object") {
+			width = opts.width;
+			height = opts.height;
+		}
+		else
+			width = opts;
+
+		var type = typeOf(img);
+
+		// ImageData-like plain objects (Node.js): {data, width, height}
+		if (type == "Object" && img != null && img.data != null && img.width != null)
+			type = "ImageData";
+
+		switch (type) {
 			case "HTMLImageElement":
 				can = document.createElement("canvas");
 				can.width = img.naturalWidth;
@@ -855,23 +1234,64 @@
 			case "ImageData":
 				imgd = imgd || img;
 				width = imgd.width;
+				height = imgd.height;
 				if (typeOf(imgd.data) == "CanvasPixelArray")
 					buf8 = new Uint8Array(imgd.data);
 				else
 					buf8 = imgd.data;
+				break;
 			case "Array":
 			case "CanvasPixelArray":
-				buf8 = buf8 || new Uint8Array(img);
+				buf8 = new Uint8Array(img);
+				break;
 			case "Uint8Array":
 			case "Uint8ClampedArray":
-				buf8 = buf8 || img;
-				buf32 = new Uint32Array(buf8.buffer);
+				buf8 = img;
+				break;
 			case "Uint32Array":
-				buf32 = buf32 || img;
-				buf8 = buf8 || new Uint8Array(buf32.buffer);
-				width = width || buf32.length;
-				height = buf32.length / width;
+				buf32 = img;
+				break;
+			default:
+				throw quantErr("unsupported image type: " + type);
 		}
+
+		if (buf32) {
+			if (buf32.byteOffset != 0 || buf32.byteLength != buf32.buffer.byteLength)
+				buf32 = new Uint32Array(buf32.buffer, buf32.byteOffset, buf32.length);
+			buf8 = new Uint8Array(buf32.buffer, buf32.byteOffset, buf32.byteLength);
+		}
+		else {
+			if (!buf8 || buf8.length % 4 != 0)
+				throw quantErr("image data length " + (buf8 ? buf8.length : 0) + " is not a multiple of 4 (RGBA)");
+			buf32 = u32view(buf8);
+		}
+
+		var numPx = buf32.length;
+
+		// width/height of 0 are treated as unset (legacy behavior)
+		if (width != null && (!isInt(width) || width < 0))
+			throw quantErr("width must be a positive integer, got " + width);
+		if (height != null && (!isInt(height) || height < 0))
+			throw quantErr("height must be a positive integer, got " + height);
+		if (!width) width = null;
+		if (!height) height = null;
+
+		if (width != null && height != null && width * height > MAX_PIXELS)
+			throw quantErr("image dimensions " + width + "x" + height + " exceed maximum of " + MAX_PIXELS + " pixels");
+
+		if (numPx == 0)
+			throw quantErr("image data is empty");
+
+		if (width == null)
+			width = numPx;
+		if (height == null) {
+			if (numPx % width != 0)
+				throw quantErr("pixel count " + numPx + " is not divisible by width " + width);
+			height = numPx / width;
+		}
+
+		if (width * height != numPx)
+			throw quantErr("pixel count " + numPx + " does not match dimensions " + width + "x" + height);
 
 		return {
 			can: can,
@@ -912,7 +1332,9 @@
 		} while (i <= i1);
 	}
 
-	// returns array of hash keys sorted by their values
+	// returns array of hash keys sorted by their values;
+	// ties are broken deterministically by ascending numeric key (color value),
+	// so the result never depends on histogram insertion order
 	function sortedHashKeys(obj, desc) {
 		var keys = [];
 
@@ -920,7 +1342,7 @@
 			keys.push(key);
 
 		return sort.call(keys, function(a,b) {
-			return desc ? obj[b] - obj[a] : obj[a] - obj[b];
+			return desc ? (obj[b] - obj[a] || a - b) : (obj[a] - obj[b] || a - b);
 		});
 	}
 

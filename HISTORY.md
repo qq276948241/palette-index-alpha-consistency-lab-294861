@@ -4,6 +4,14 @@ History
 #### 2.0.0 _(????-??-??)_
 - Transparency quant support (like pornel/pngquant, png8)
 
+#### 1.3.0 _(unreleased)_
+- Explicit alpha strategies via `alphaMode`: `"ignore"` (legacy default), `"transparent"` (single reserved transparent palette slot, counted against the `colors` budget), `"premultiply"` (premultiplied-alpha colors participate in quantization); `alphaThreshold` option
+- New APIs: `paletteRGBA()`, `expand(indexed, width, height)` (reverse of indexed reduce), tiled `sample(img, {width, height, x, y, fullWidth, fullHeight})` with whole-image-equivalent histograms, optional `width` arg for `reduce()`/`dither()`
+- Deterministic ordering: histogram frequency ties break by ascending color value, palette sorting is stable, equal-distance reductions keep original order
+- Input validation with stable `RgbQuant:` errors (empty data, bad lengths/dimensions, oversized images, invalid palette channels, bad tile geometry, invalid expand indices); typed-array views with non-zero `byteOffset` are read correctly
+- Dithering fixes: transparent pixels stay transparent and never diffuse error into opaque regions; dithering no longer mutates the caller's buffer (repeated `reduce()` reproduces pixel-for-pixel)
+- Pure-Node test suite in `test/` (`npm test`)
+
 #### 1.2.0 _(2015-??-??)_
 - Ordered dithering & half-toning (#10)
   - wiki: http://en.wikipedia.org/wiki/Ordered_dithering

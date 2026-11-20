@@ -134,32 +134,50 @@
 			[255, 255, 255],
 		];
 
-		var q = new RgbQuant({
+		// Sega Master System, plus a transparent slot ([r,g,b,a] with a <= alphaThreshold)
+		var rgb6bitT = rgb6bit.concat([[0,0,0,0]]);
+
+		var opts = {
 			colors: 32,
-			palette: rgb6bit,
+			palette: rgb6bitT,
 			reIndex: true,
+			alphaMode: "transparent",	// "ignore" | "transparent" | "premultiply"
+			alphaThreshold: 0,			// pixels with alpha <= this map to the transparent slot
 			dithKern: "FloydSteinberg",
 			dithDelta: 0.05,
 			useCache: false,
-		});
+		};
+
+		var q = new RgbQuant(opts);
 
 		var rgb6bit32 = [];
-		rgb6bit.forEach(function(rgb) {
-			rgb6bit32 = rgb6bit32.concat(rgb.concat(255));
+		rgb6bitT.forEach(function(rgb) {
+			rgb6bit32 = rgb6bit32.concat(rgb.length > 3 ? rgb : rgb.concat(255));
 		});
 
 		window.onload = function() {
 			var img = document.getElementById("moo");
 			console.time("quant");
 			q.sample(img);
-			var pal = q.palette();
+			var pal = q.paletteRGBA();
 			var reduced = q.reduce(img);
+			// indexed form, then reverse-expanded back to RGBA via the palette
+			var indexed = q.reduce(img, 2);
+			var expanded = q.expand(indexed, img.naturalWidth, img.naturalHeight);
 			console.timeEnd("quant");
+
+			var pre = document.createElement("pre");
+			pre.textContent = "alphaMode: " + opts.alphaMode + ", alphaThreshold: " + opts.alphaThreshold +
+				", transparent slot index: " + (q.hasTrans ? q.i32idx[q.transI32] : "none") +
+				", palette entries: " + (pal.length / 4) + " / " + opts.colors;
+			document.body.appendChild(pre);
+
 			putPixels(reduced, img.naturalWidth, img.naturalHeight);
+			putPixels(expanded, img.naturalWidth, img.naturalHeight, "expanded");
 
 			document.body.appendChild(document.createElement("br"));
-			putPixels(rgb6bit32, 8, 8, "pal_orig");
-			putPixels(pal, 8, 8, "pal_final");
+			putPixels(rgb6bit32, 9, Math.ceil(rgb6bit32.length / 4 / 9), "pal_orig");
+			putPixels(pal, 9, Math.ceil(pal.length / 4 / 9), "pal_final");
 		};
 
 		function putPixels(subpxArr, width, height, id) {
